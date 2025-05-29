@@ -1,0 +1,17 @@
+[package]
+name = "messages"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+anyhow-http = { version = "0.4.3", features = ["axum", "derive", "json"] }
+async-utf8-decoder = "1.0.1"
+axum = { version = "0.8.4", features = ["http2", "macros", "ws"] }
+console-subscriber = "0.4.1"
+dashmap = "6.1.0"
+futures = "0.3.31"
+reqwest = { version = "0.12.18", features = ["rustls-tls", "stream"] }
+sqlx = { version = "0.8.6", features = ["derive", "runtime-tokio", "sqlite", "tls-rustls", "uuid"] }
+tokio = { version = "1.45.1", features = ["full"] }
+tokio-stream = { version = "0.1.17", features = ["full"] }
