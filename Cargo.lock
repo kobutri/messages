@@ -1172,6 +1172,7 @@ dependencies = [
  "dotenvy",
  "dotenvy_macro",
  "futures",
+ "redb",
  "reqwest",
  "serde",
  "serde_json",
@@ -1559,6 +1560,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
 dependencies = [
  "getrandom 0.3.3",
+]
+
+[[package]]
+name = "redb"
+version = "2.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cef6a6d3a65ea334d6cdfb31fa2525c20184b7aa7bd1ad1e2e37502610d4609f"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
