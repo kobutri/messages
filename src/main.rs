@@ -1,7 +1,7 @@
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 use anyhow_http::http::StatusCode;
 use anyhow_http::response::HttpJsonResult;
-use anyhow_http::{OptionExt, http_error, http_error_bail};
+use anyhow_http::{OptionExt, http_error};
 use axum::Json;
 use axum::{
     Router,
@@ -13,8 +13,9 @@ use axum::{
 use dashmap::DashMap;
 use dotenvy_macro::dotenv;
 use futures::{StreamExt, stream};
-use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use sled::transaction::ConflictableTransactionError;
+use sled::Db;
 use std::collections::HashSet;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
@@ -24,7 +25,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
 struct AppState {
-    db: Database,
+    db: Db,
     streams: DashMap<String, Arc<Mutex<Sender<String>>>>,
 }
 
@@ -40,16 +41,23 @@ impl AppInspect {
     fn from_state(state: &AppState) -> Self {
         let streams_total: usize = state.streams.len();
         let mut chats_total: usize = 0;
-        let read = state.db.begin_read().unwrap();
-        let table = read.open_table(TABLE).unwrap();
 
-        let chats = table
+        let chats = state
+            .db
             .iter()
-            .unwrap()
-            .map(|r| {
-                let r = r.unwrap();
-                chats_total += r.1.value().len();
-                (r.0.value().to_string(), r.1.value().len())
+            .filter_map(|r| {
+                match r {
+                    Ok((k, v)) => {
+                        let key = String::from_utf8(k.to_vec()).unwrap();
+                        let value = String::from_utf8(v.to_vec()).unwrap();
+                        chats_total += value.len();
+                        Some((key, value.len()))
+                    },
+                    Err(e) => {
+                        eprintln!("Error reading from database: {:?}", e);
+                        return None;
+                    }
+                }
             })
             .collect();
         let streams = state.streams.iter().map(|r| r.key().clone()).collect();
@@ -62,12 +70,17 @@ impl AppInspect {
     }
 }
 
-const TABLE: TableDefinition<String, String> = TableDefinition::new("chats");
 const DATABASE: &str = dotenv!("DATABASE");
 
 #[tokio::main]
 async fn main() {
-    let db = Database::create(DATABASE).expect("Failed to create database");
+    let db = sled::Config::default()
+        .path(DATABASE)
+        .cache_capacity(10_000_000)
+        .mode(sled::Mode::HighThroughput)
+        .use_compression(false)
+        .open()
+        .expect(&format!("Failed to open database: {}", DATABASE));
 
     let state = Arc::new(AppState {
         db,
@@ -117,18 +130,14 @@ async fn connect(
 ) -> HttpJsonResult<impl IntoResponse> {
     let id = params.get("id").ok_or_status(StatusCode::BAD_REQUEST)?;
     let old_content = async || -> HttpJsonResult<String> {
-        let read = state
-            .db
-            .begin_read()
-            .map_err(|e| http_error!(INTERNAL_SERVER_ERROR, "Database read error: {}", e))?;
-        let table = read
-            .open_table(TABLE)
-            .map_err(|e| http_error!(INTERNAL_SERVER_ERROR, "Failed to open table: {}", e))?;
-        match table.get(id) {
-            Ok(Some(content)) => Ok(content.value()),
-            Ok(None) => http_error_bail!(NOT_FOUND, "Chat not found"),
-            Err(e) => http_error_bail!(INTERNAL_SERVER_ERROR, "Database error: {}", e),
-        }
+        let res = state.db.get(id)?.ok_or(http_error!(
+            NOT_FOUND,
+            "Chat with id {} not found",
+            id
+        ))?;
+        let res = String::from_utf8(res.to_vec())
+            .map_err(|_| http_error!(INTERNAL_SERVER_ERROR, "Invalid UTF-8 in chat content"))?;
+        Ok(res)
     };
     if let Some(sender) = state.streams.get(id) {
         let sender = sender.lock().await;
@@ -165,23 +174,7 @@ async fn create_new(
         Duration::from_secs_f32(1.0 / freq),
     );
 
-    {
-        let Ok(mut write) = state.db.begin_write() else {
-            http_error_bail!(INTERNAL_SERVER_ERROR, "Database write error");
-        };
-        write.set_durability(redb::Durability::Eventual);
-        {
-            let Ok(mut table) = write.open_table(TABLE) else {
-                http_error_bail!(INTERNAL_SERVER_ERROR, "Failed to open table");
-            };
-            let Ok(_) = table.insert(id.clone(), "".to_string()) else {
-                http_error_bail!(INTERNAL_SERVER_ERROR, "Failed to insert chat");
-            };
-        }
-        if let Err(e) = write.commit() {
-            http_error_bail!(INTERNAL_SERVER_ERROR, "Failed to commit transaction: {}", e);
-        }
-    }
+    state.db.insert(id.clone(), "")?;
     let (sender, receiver) = broadcast::channel(100);
     let sender = Arc::new(Mutex::new(sender));
     state.streams.insert(id.clone(), sender.clone());
@@ -194,38 +187,30 @@ async fn create_new(
             stream
                 .for_each(async |s| {
                     let tx = tx.lock().await;
-                    if let Err(e) = tx.send(s.clone()) {
-                        eprintln!("Error sending to stream: {}", e);
-                    }
-                    if let Err(e) = state
-                        .db
-                        .begin_write()
-                        .context("failed to begin write transaction")
-                        .and_then(|mut write| {
-                            {
-                                write.set_durability(redb::Durability::Eventual);
-                                let mut table =
-                                    write.open_table(TABLE).context("Failed to open table")?;
-                                let new_value = {
-                                    let mut v = table
-                                        .get(&id)
-                                        .context(format!("Failed to get chat with id {}", &id))?
-                                        .ok_or(anyhow!("Chat not found"))?
-                                        .value();
-                                    v.push_str(&s);
-                                    v
-                                };
-                                table
-                                    .insert(&id, new_value)
-                                    .context("Failed to insert chat")?;
-                            }
-                            write.commit().context("Failed to commit transaction")?;
-
-                            Ok(())
-                        })
-                    {
+                    if let Err(e) = state.db.transaction(|db| {
+                        let Some(old) = db.remove(id.as_bytes())? else {
+                            return Err(ConflictableTransactionError::Abort(anyhow!(
+                                "Chat with id {} not found",
+                                id
+                            )));
+                        };
+                        let Ok(mut v)=  String::from_utf8(old.to_vec()) else {
+                            return Err(ConflictableTransactionError::Abort(anyhow!(
+                                "Invalid UTF-8 in chat content"
+                            )));
+                        };
+                        v.push_str(&s);
+                        db.insert(id.as_bytes(), v.as_bytes())?;
+                        
+                        Ok(())
+                    }) {
                         eprintln!("Error writing to database: {}", e);
                         return;
+                    }
+
+                    
+                    if let Err(e) = tx.send(s.clone()) {
+                        eprintln!("Error sending to stream: {}", e);
                     }
                 })
                 .await;
