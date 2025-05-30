@@ -14,8 +14,8 @@ use dashmap::DashMap;
 use dotenvy_macro::dotenv;
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use sled::transaction::ConflictableTransactionError;
 use sled::Db;
+use sled::transaction::ConflictableTransactionError;
 use std::collections::HashSet;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
@@ -45,18 +45,16 @@ impl AppInspect {
         let chats = state
             .db
             .iter()
-            .filter_map(|r| {
-                match r {
-                    Ok((k, v)) => {
-                        let key = String::from_utf8(k.to_vec()).unwrap();
-                        let value = String::from_utf8(v.to_vec()).unwrap();
-                        chats_total += value.len();
-                        Some((key, value.len()))
-                    },
-                    Err(e) => {
-                        eprintln!("Error reading from database: {:?}", e);
-                        return None;
-                    }
+            .filter_map(|r| match r {
+                Ok((k, v)) => {
+                    let key = String::from_utf8(k.to_vec()).unwrap();
+                    let value = String::from_utf8(v.to_vec()).unwrap();
+                    chats_total += value.len();
+                    Some((key, value.len()))
+                }
+                Err(e) => {
+                    eprintln!("Error reading from database: {:?}", e);
+                    return None;
                 }
             })
             .collect();
@@ -79,6 +77,7 @@ async fn main() {
         .cache_capacity(10_000_000)
         .mode(sled::Mode::HighThroughput)
         .use_compression(false)
+        .flush_every_ms(Some(1000))
         .open()
         .expect(&format!("Failed to open database: {}", DATABASE));
 
@@ -91,13 +90,19 @@ async fn main() {
         .route("/", get(connect))
         .route("/", post(create_new))
         .route("/inspect", get(inspect))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+
+    state
+        .db
+        .flush_async()
+        .await
+        .expect("Failed to flush database");
 }
 
 async fn shutdown_signal() {
@@ -130,11 +135,11 @@ async fn connect(
 ) -> HttpJsonResult<impl IntoResponse> {
     let id = params.get("id").ok_or_status(StatusCode::BAD_REQUEST)?;
     let old_content = async || -> HttpJsonResult<String> {
-        let res = state.db.get(id)?.ok_or(http_error!(
-            NOT_FOUND,
-            "Chat with id {} not found",
-            id
-        ))?;
+        let res =
+            state
+                .db
+                .get(id)?
+                .ok_or(http_error!(NOT_FOUND, "Chat with id {} not found", id))?;
         let res = String::from_utf8(res.to_vec())
             .map_err(|_| http_error!(INTERNAL_SERVER_ERROR, "Invalid UTF-8 in chat content"))?;
         Ok(res)
@@ -194,21 +199,20 @@ async fn create_new(
                                 id
                             )));
                         };
-                        let Ok(mut v)=  String::from_utf8(old.to_vec()) else {
+                        let Ok(mut v) = String::from_utf8(old.to_vec()) else {
                             return Err(ConflictableTransactionError::Abort(anyhow!(
                                 "Invalid UTF-8 in chat content"
                             )));
                         };
                         v.push_str(&s);
                         db.insert(id.as_bytes(), v.as_bytes())?;
-                        
+
                         Ok(())
                     }) {
                         eprintln!("Error writing to database: {}", e);
                         return;
                     }
 
-                    
                     if let Err(e) = tx.send(s.clone()) {
                         eprintln!("Error sending to stream: {}", e);
                     }
