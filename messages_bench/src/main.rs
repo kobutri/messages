@@ -5,7 +5,6 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::future::join_all;
 use rand::Rng;
-use reqwest::get;
 use tokio::join;
 
 struct Channel {
