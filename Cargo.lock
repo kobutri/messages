@@ -1375,6 +1375,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "anyhow-http",
+ "async-stream",
  "async-utf8-decoder",
  "axum 0.8.4",
  "console-subscriber",

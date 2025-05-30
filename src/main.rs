@@ -1,5 +1,5 @@
-use anyhow_http::response::HttpJsonResult;
 use anyhow_http::OptionExt;
+use anyhow_http::response::HttpJsonResult;
 use anyhow_http::{http::StatusCode, http_error};
 use axum::{
     Router,
@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use dashmap::DashMap;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use sqlx::{PgPool, Pool, Postgres, migrate::MigrateDatabase};
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
@@ -80,7 +80,12 @@ async fn connect(
         let stream = futures::StreamExt::chain(
             stream::iter(vec![old_content, guard.buffer.clone()]).map(|x| Ok(x)),
             BroadcastStream::new(guard.sender.subscribe()),
-        );
+        )
+        .inspect(|s| {
+            if let Err(e) = s {
+                eprintln!("Error in stream: {}", e);
+            }
+        });
         Ok(Body::from_stream(stream).into_response())
     } else {
         Ok(old_content().await?.into_response())
@@ -96,18 +101,19 @@ async fn create_new(
         .get("freq")
         .and_then(|f| f.parse().ok())
         .unwrap_or(20.0);
-    let max: usize = params.get("max").and_then(|m| m.parse().ok()).unwrap_or(50);
+    let max: usize = params.get("max").and_then(|m| m.parse().ok()).unwrap_or(10);
     let id = body;
-    let stream = tokio_stream::StreamExt::throttle(
-        stream::iter((1..=max).map({
-            let id = id.clone();
-            move |i| {
+    let stream = {
+        let id = id.clone();
+        async_stream::stream! {
+            let mut interval = interval(Duration::from_secs_f32(1.0 / freq));
+            for i in 1..=max {
                 let content = format!("{}: {}\n", i, &id);
-                content
+                interval.tick().await;
+                yield content;
             }
-        })),
-        Duration::from_secs_f32(1.0 / freq),
-    );
+        }
+    };
     let row = sqlx::query!(
         "INSERT INTO chat (name, content) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET content = EXCLUDED.content RETURNING id",
         id,
@@ -116,14 +122,17 @@ async fn create_new(
     .fetch_one(&state.pool)
     .await?;
     let row_id = row.id;
-    println!("Created new chat with id: {}", row_id);
-    let (sender, receiver) = broadcast::channel(100);
+    let (sender, receiver) = broadcast::channel(200);
     let stream_state = Arc::new(Mutex::new(StreamState {
         sender: sender.clone(),
         buffer: String::new(),
     }));
     state.streams.insert(id.clone(), stream_state.clone());
-    let return_stream = BroadcastStream::new(receiver);
+    let return_stream = BroadcastStream::new(receiver).inspect(|s| {
+        if let Err(e) = s {
+            eprintln!("Error in stream: {}", e);
+        }
+    });
     tokio::task::spawn({
         let stream_state = stream_state.clone();
         let state = state.clone();
