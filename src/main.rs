@@ -1,7 +1,7 @@
-use anyhow_http::{http_error_bail, OptionExt};
+use anyhow_http::http::StatusCode;
 use anyhow_http::response::HttpJsonResult;
-use anyhow_http::{http::StatusCode, http_error};
-use axum::body::BodyDataStream;
+use anyhow_http::{OptionExt, http_error_bail};
+use axum::Json;
 use axum::{
     Router,
     body::Body,
@@ -10,20 +10,48 @@ use axum::{
     routing::{get, post},
 };
 use dashmap::DashMap;
-use futures::future::join_all;
 use futures::{StreamExt, stream};
-use sqlx::{Acquire, PgPool, Pool, Postgres, migrate::MigrateDatabase};
-use tokio::time::timeout;
-use std::future;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::broadcast::Sender;
-use tokio::sync::{Mutex, RwLock, broadcast};
-use tokio::task::JoinSet;
+use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
+
 struct AppState {
-    pool: Pool<Postgres>,
+    chats: DashMap<String, String>,
     streams: DashMap<String, Arc<Mutex<Sender<String>>>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AppInspect {
+    streams_total: usize,
+    chats_total: usize,
+    chats: HashMap<String, usize>,
+    streams: HashSet<String>,
+}
+
+impl AppInspect {
+    fn from_state(state: &AppState) -> Self {
+        let mut streams_total: usize = 0;
+        let chats_total = state.chats.len();
+        let chats = state
+            .chats
+            .iter()
+            .map(|r| {
+                streams_total += r.value().len();
+                (r.key().clone(), r.value().len())
+            })
+            .collect();
+        let streams = state.streams.iter().map(|r| r.key().clone()).collect();
+        Self {
+            streams_total,
+            chats_total,
+            chats,
+            streams,
+        }
+    }
 }
 
 const CONNECTION_STR: &str = dotenvy_macro::dotenv!("DATABASE_URL");
@@ -31,28 +59,16 @@ const CONNECTION_STR: &str = dotenvy_macro::dotenv!("DATABASE_URL");
 #[tokio::main]
 async fn main() {
     console_subscriber::init();
-    
-    if !<Postgres as MigrateDatabase>::database_exists(CONNECTION_STR)
-        .await
-        .unwrap()
-    {
-        <Postgres as MigrateDatabase>::create_database(CONNECTION_STR)
-            .await
-            .unwrap()
-    }
-
-    let pool = PgPool::connect(CONNECTION_STR).await.unwrap();
-
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
     let state = Arc::new(AppState {
-        pool: pool,
+        chats: DashMap::new(),
         streams: DashMap::new(),
     });
 
     let app = Router::new()
         .route("/", get(connect))
         .route("/", post(create_new))
+        .route("/inspect", get(inspect))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -65,12 +81,11 @@ async fn connect(
 ) -> HttpJsonResult<impl IntoResponse> {
     let id = params.get("id").ok_or_status(StatusCode::BAD_REQUEST)?;
     let old_content = async || -> HttpJsonResult<String> {
-        let query = sqlx::query!("SELECT content from chat WHERE name = $1", id)
-            .fetch_one(&state.pool)
-            .await
-            .map_err(|_| http_error!(NOT_FOUND))?;
-
-        Ok(query.content.unwrap_or_default())
+        if let Some(content) = state.chats.get(id) {
+            Ok(content.clone())
+        } else {
+            http_error_bail!(NOT_FOUND, "Chat not found");
+        }
     };
     if let Some(sender) = state.streams.get(id) {
         let sender = sender.lock().await;
@@ -106,15 +121,9 @@ async fn create_new(
         })),
         Duration::from_secs_f32(1.0 / freq),
     );
-    let row = sqlx::query!(
-        "INSERT INTO chat (name, content) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET content = EXCLUDED.content RETURNING id",
-        id,
-        ""
-    )
-    .fetch_one(&state.pool)
-    .await?;
-    let row_id = row.id;
-    println!("Created new chat with id: {}", row_id);
+
+    state.chats.insert(id.clone(), "".to_string());
+    println!("Created new chat with id: {}", &id);
     let (sender, receiver) = broadcast::channel(100);
     let sender = Arc::new(Mutex::new(sender));
     state.streams.insert(id.clone(), sender.clone());
@@ -124,34 +133,27 @@ async fn create_new(
         let state = state.clone();
         let id = id.clone();
         async move {
-            let mut set = JoinSet::new();
             stream
-                .for_each(|s| {
-                    let tx = tx.clone();
-                    let state = state.clone();
-                    set.spawn(async move {
-                        let tx = tx.lock().await;
-                        if let Err(e) = tx.send(s.clone()) {
-                            eprintln!("Error sending to stream: {}", e);
-                        }
-                        if let Err(e) = sqlx::query!(
-                            "UPDATE chat SET content = chat.content || $1 WHERE id = $2",
-                            s,
-                            row_id
-                        )
-                        .execute(&state.pool)
-                        .await
-                        {
-                            eprintln!("Error updating chat: {}", e);
-                        }
-                    });
-                    future::ready(())
+                .for_each(async |s| {
+                    let tx = tx.lock().await;
+                    if let Err(e) = tx.send(s.clone()) {
+                        eprintln!("Error sending to stream: {}", e);
+                    }
+                    if let Some(mut chat) = state.chats.get_mut(&id) {
+                        chat.push_str(&s);
+                    } else {
+                        eprintln!("Chat with id {} not found", id);
+                        return;
+                    }
                 })
                 .await;
-            set.join_all().await;
             state.streams.remove(&id);
             println!("Stream for {} has ended", id);
         }
     });
     Ok(Body::from_stream(return_stream).into_response())
+}
+
+async fn inspect(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    return Json(AppInspect::from_state(&state)).into_response();
 }
