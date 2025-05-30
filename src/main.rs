@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{Context, anyhow, bail};
 use anyhow_http::http::StatusCode;
 use anyhow_http::response::HttpJsonResult;
 use anyhow_http::{OptionExt, http_error};
@@ -14,8 +14,6 @@ use dashmap::DashMap;
 use dotenvy_macro::dotenv;
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use sled::Db;
-use sled::transaction::ConflictableTransactionError;
 use std::collections::HashSet;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
@@ -25,7 +23,8 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
 struct AppState {
-    db: Db,
+    keyspace: fjall::TransactionalKeyspace,
+    db: fjall::TransactionalPartition,
     streams: DashMap<String, Arc<Mutex<Sender<String>>>>,
 }
 
@@ -38,26 +37,26 @@ struct AppInspect {
 }
 
 impl AppInspect {
-    fn from_state(state: &AppState) -> Self {
+    async fn from_state(state: Arc<AppState>) -> Self {
         let streams_total: usize = state.streams.len();
         let mut chats_total: usize = 0;
-
-        let chats = state
-            .db
-            .iter()
-            .filter_map(|r| match r {
-                Ok((k, v)) => {
-                    let key = String::from_utf8(k.to_vec()).unwrap();
-                    let value = String::from_utf8(v.to_vec()).unwrap();
-                    chats_total += value.len();
-                    Some((key, value.len()))
-                }
-                Err(e) => {
-                    eprintln!("Error reading from database: {:?}", e);
-                    return None;
-                }
-            })
-            .collect();
+        let chats = tokio::task::spawn_blocking({
+            let state = state.clone();
+            move || {
+                let tx = state.keyspace.read_tx();
+                tx.iter(&state.db)
+                    .filter_map(|r| r.ok())
+                    .map(|(k, v)| {
+                        let key = String::from_utf8(k.to_vec()).unwrap();
+                        let value = String::from_utf8(v.to_vec()).unwrap();
+                        chats_total += value.len();
+                        (key, value.len())
+                    })
+                    .collect::<HashMap<String, usize>>()
+            }
+        })
+        .await
+        .expect("Failed to read from database");
         let streams = state.streams.iter().map(|r| r.key().clone()).collect();
         Self {
             streams_total,
@@ -72,16 +71,15 @@ const DATABASE: &str = dotenv!("DATABASE");
 
 #[tokio::main]
 async fn main() {
-    let db = sled::Config::default()
-        .path(DATABASE)
-        .cache_capacity(10_000_000)
-        .mode(sled::Mode::HighThroughput)
-        .use_compression(false)
-        .flush_every_ms(Some(1000))
-        .open()
+    let keyspace = fjall::Config::new(DATABASE)
+        .open_transactional()
         .expect(&format!("Failed to open database: {}", DATABASE));
+    let db = keyspace
+        .open_partition("chats", fjall::PartitionCreateOptions::default())
+        .expect("Failed to open partition 'chats'");
 
     let state = Arc::new(AppState {
+        keyspace,
         db,
         streams: DashMap::new(),
     });
@@ -98,11 +96,11 @@ async fn main() {
         .await
         .unwrap();
 
-    state
-        .db
-        .flush_async()
-        .await
-        .expect("Failed to flush database");
+    // state
+    //     .db
+    //     .flush_async()
+    //     .await
+    //     .expect("Failed to flush database");
 }
 
 async fn shutdown_signal() {
@@ -135,11 +133,17 @@ async fn connect(
 ) -> HttpJsonResult<impl IntoResponse> {
     let id = params.get("id").ok_or_status(StatusCode::BAD_REQUEST)?;
     let old_content = async || -> HttpJsonResult<String> {
-        let res =
-            state
-                .db
-                .get(id)?
-                .ok_or(http_error!(NOT_FOUND, "Chat with id {} not found", id))?;
+        let res = tokio::task::spawn_blocking({
+            let state = state.clone();
+            let id = id.clone();
+            move || {
+                let tx = state.keyspace.read_tx();
+                tx.get(&state.db, id.as_bytes())
+                    .map_err(|e| http_error!(INTERNAL_SERVER_ERROR, "Database error: {}", e))
+            }
+        })
+        .await??
+        .ok_or(http_error!(NOT_FOUND, "Chat with id {} not found", id))?;
         let res = String::from_utf8(res.to_vec())
             .map_err(|_| http_error!(INTERNAL_SERVER_ERROR, "Invalid UTF-8 in chat content"))?;
         Ok(res)
@@ -179,7 +183,17 @@ async fn create_new(
         Duration::from_secs_f32(1.0 / freq),
     );
 
-    state.db.insert(id.clone(), "")?;
+    tokio::task::spawn_blocking({
+        let state = state.clone();
+        let id = id.clone();
+        move || {
+            state
+                .db
+                .insert(id.as_bytes(), "")
+                .map_err(|e| http_error!(INTERNAL_SERVER_ERROR, "Database error: {}", e))
+        }
+    })
+    .await??;
     let (sender, receiver) = broadcast::channel(100);
     let sender = Arc::new(Mutex::new(sender));
     state.streams.insert(id.clone(), sender.clone());
@@ -192,23 +206,25 @@ async fn create_new(
             stream
                 .for_each(async |s| {
                     let tx = tx.lock().await;
-                    if let Err(e) = state.db.transaction(|db| {
-                        let Some(old) = db.remove(id.as_bytes())? else {
-                            return Err(ConflictableTransactionError::Abort(anyhow!(
-                                "Chat with id {} not found",
-                                id
-                            )));
-                        };
-                        let Ok(mut v) = String::from_utf8(old.to_vec()) else {
-                            return Err(ConflictableTransactionError::Abort(anyhow!(
-                                "Invalid UTF-8 in chat content"
-                            )));
-                        };
-                        v.push_str(&s);
-                        db.insert(id.as_bytes(), v.as_bytes())?;
-
-                        Ok(())
-                    }) {
+                    let s = s.clone();
+                    let id = id.clone();
+                    if let Err(e) = tokio::task::spawn_blocking({
+                        let state = state.clone();
+                        let s = s.clone();
+                        move || -> Result<(), anyhow::Error> {
+                            let mut tx = state.keyspace.write_tx()?;
+                            let Some(re) = tx.get(&state.db, id.as_bytes())? else {
+                                bail!("Chat with id {} not found", id);
+                            };
+                            let mut v = String::from_utf8(re.to_vec())?;
+                            v.push_str(&s);
+                            tx.insert(&state.db, id.as_bytes(), v.as_bytes());
+                            tx.commit()??;
+                            Ok(())
+                        }
+                    })
+                    .await
+                    {
                         eprintln!("Error writing to database: {}", e);
                         return;
                     }
@@ -225,5 +241,5 @@ async fn create_new(
 }
 
 async fn inspect(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    return Json(AppInspect::from_state(&state)).into_response();
+    return Json(AppInspect::from_state(state).await).into_response();
 }
