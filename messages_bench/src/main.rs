@@ -30,7 +30,7 @@ impl DecodedChannel {
     }
 }
 
-const CHANNEL_COUNT: usize = 1000;
+const CHANNEL_COUNT: usize = 2000;
 
 #[tokio::main]
 async fn main() {
@@ -42,9 +42,9 @@ async fn main() {
     let handles = (0..CHANNEL_COUNT)
         .map(|o| {
             let channel_name = Arc::new(format!("channel_{}", o));
-            let freq = rand::rng().random_range(250.0f32..=250.0).round();
+            let freq = rand::rng().random_range(500.0f32..=1000.0).round();
             let max = 2000;
-            let client_count = rand::rng().random_range(10..=10);
+            let client_count = rand::rng().random_range(5..=10);
             let channel = Channel {
                 original: Bytes::new(),
                 clients: vec![Bytes::new(); client_count],
