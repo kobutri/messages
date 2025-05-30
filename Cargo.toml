@@ -10,8 +10,10 @@ async-utf8-decoder = "1.0.1"
 axum = { version = "0.8.4", features = ["http2", "macros", "ws"] }
 console-subscriber = "0.4.1"
 dashmap = "6.1.0"
+dotenvy = "0.15.7"
+dotenvy_macro = "0.15.7"
 futures = "0.3.31"
 reqwest = { version = "0.12.18", features = ["rustls-tls", "stream"] }
-sqlx = { version = "0.8.6", features = ["derive", "runtime-tokio", "sqlite", "tls-rustls", "uuid"] }
-tokio = { version = "1.45.1", features = ["full"] }
+sqlx = { version = "0.8.6", features = ["derive", "runtime-tokio", "postgres", "tls-rustls", "uuid"] }
+tokio = { version = "1.45.1", features = ["full", "tracing"] }
 tokio-stream = { version = "0.1.17", features = ["full"] }

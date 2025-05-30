@@ -1,7 +1,7 @@
-use anyhow_http::OptionExt;
+use anyhow_http::{http_error_bail, OptionExt};
 use anyhow_http::response::HttpJsonResult;
 use anyhow_http::{http::StatusCode, http_error};
-use async_utf8_decoder::Utf8Decoder;
+use axum::body::BodyDataStream;
 use axum::{
     Router,
     body::Body,
@@ -10,39 +10,40 @@ use axum::{
     routing::{get, post},
 };
 use dashmap::DashMap;
-use futures::{StreamExt, TryStreamExt, stream};
-use sqlx::{Connection, Pool, Sqlite, SqliteConnection, SqlitePool, migrate::MigrateDatabase, pool::PoolConnection, Acquire};
-use std::{collections::HashMap, future, io, sync::Arc};
+use futures::future::join_all;
+use futures::{StreamExt, stream};
+use sqlx::{Acquire, PgPool, Pool, Postgres, migrate::MigrateDatabase};
+use tokio::time::timeout;
+use std::future;
+use std::time::Duration;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::broadcast::Sender;
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio_stream::wrappers::BroadcastStream;
-
-const CONNECTION_STR: &str = "sqlite:../chats.db";
-
 struct AppState {
-    pool: Pool<Sqlite>,
+    pool: Pool<Postgres>,
     streams: DashMap<String, Arc<Mutex<Sender<String>>>>,
 }
+
+const CONNECTION_STR: &str = dotenvy_macro::dotenv!("DATABASE_URL");
 
 #[tokio::main]
 async fn main() {
     console_subscriber::init();
-
-    if !<Sqlite as MigrateDatabase>::database_exists(CONNECTION_STR)
+    
+    if !<Postgres as MigrateDatabase>::database_exists(CONNECTION_STR)
         .await
         .unwrap()
     {
-        <Sqlite as MigrateDatabase>::create_database(CONNECTION_STR)
+        <Postgres as MigrateDatabase>::create_database(CONNECTION_STR)
             .await
             .unwrap()
     }
 
-    let pool = SqlitePool::connect(CONNECTION_STR).await.unwrap();
+    let pool = PgPool::connect(CONNECTION_STR).await.unwrap();
 
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-
-    let connection = pool.acquire().await.unwrap();
 
     let state = Arc::new(AppState {
         pool: pool,
@@ -54,7 +55,7 @@ async fn main() {
         .route("/", post(create_new))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -64,18 +65,20 @@ async fn connect(
 ) -> HttpJsonResult<impl IntoResponse> {
     let id = params.get("id").ok_or_status(StatusCode::BAD_REQUEST)?;
     let old_content = async || -> HttpJsonResult<String> {
-        let query = sqlx::query!("SELECT content from chat WHERE name = ?", id)
+        let query = sqlx::query!("SELECT content from chat WHERE name = $1", id)
             .fetch_one(&state.pool)
             .await
             .map_err(|_| http_error!(NOT_FOUND))?;
 
         Ok(query.content.unwrap_or_default())
     };
-    if let Some(sender) = state.streams.get_mut(id) {
+    if let Some(sender) = state.streams.get(id) {
         let sender = sender.lock().await;
         let old_content = old_content().await?;
-        let stream = stream::once(async move { Ok(old_content) })
-            .chain(BroadcastStream::new(sender.subscribe()));
+        let stream = futures::StreamExt::chain(
+            stream::once(async move { Ok(old_content) }),
+            BroadcastStream::new(sender.subscribe()),
+        );
         Ok(Body::from_stream(stream).into_response())
     } else {
         Ok(old_content().await?.into_response())
@@ -93,51 +96,62 @@ async fn create_new(
         .unwrap_or(20.0);
     let max: usize = params.get("max").and_then(|m| m.parse().ok()).unwrap_or(50);
     let id = body;
-    let response = reqwest::get(format!("http://localhost:3000?freq={freq}&max={max}"))
-        .await?
-        .error_for_status()?;
-    let reader = response
-        .bytes_stream()
-        .map_err(io::Error::other)
-        .into_async_read();
-    let stream = Utf8Decoder::new(reader);
-    let sender = Arc::new(Mutex::new(broadcast::Sender::new(16)));
-    let mut conn = state.pool.acquire().await?;
-    let mut tx = conn.begin().await?;
-    sqlx::query!("DELETE FROM chat WHERE name = ?", id).execute(&mut *tx).await?;
-    let row_id = sqlx::query!("INSERT INTO chat (name, content) values (?, ?)", id, "")
-        .execute(&mut *tx)
-        .await?
-        .last_insert_rowid();
-    tx.commit().await?;
-
+    let stream = tokio_stream::StreamExt::throttle(
+        stream::iter((1..=max).map({
+            let id = id.clone();
+            move |i| {
+                let content = format!("{}: {}\n", i, &id);
+                content
+            }
+        })),
+        Duration::from_secs_f32(1.0 / freq),
+    );
+    let row = sqlx::query!(
+        "INSERT INTO chat (name, content) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET content = EXCLUDED.content RETURNING id",
+        id,
+        ""
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    let row_id = row.id;
+    println!("Created new chat with id: {}", row_id);
+    let (sender, receiver) = broadcast::channel(100);
+    let sender = Arc::new(Mutex::new(sender));
+    state.streams.insert(id.clone(), sender.clone());
+    let return_stream = BroadcastStream::new(receiver);
     tokio::task::spawn({
         let tx = sender.clone();
         let state = state.clone();
         let id = id.clone();
         async move {
+            let mut set = JoinSet::new();
             stream
-                .filter_map(async |s| s.ok())
-                .for_each(async |s| {
-                    let tx = tx.lock().await;
-                    if let Err(e) = sqlx::query!(
-                        "UPDATE chat SET content = content || ? WHERE id = ?",
-                        s,
-                        row_id
-                    )
-                    .execute(&state.pool)
-                    .await
-                    {
-                        eprintln!("Error updating chat: {}", e);
-                        return;
-                    }
-                    tx.send(s);
+                .for_each(|s| {
+                    let tx = tx.clone();
+                    let state = state.clone();
+                    set.spawn(async move {
+                        let tx = tx.lock().await;
+                        if let Err(e) = tx.send(s.clone()) {
+                            eprintln!("Error sending to stream: {}", e);
+                        }
+                        if let Err(e) = sqlx::query!(
+                            "UPDATE chat SET content = chat.content || $1 WHERE id = $2",
+                            s,
+                            row_id
+                        )
+                        .execute(&state.pool)
+                        .await
+                        {
+                            eprintln!("Error updating chat: {}", e);
+                        }
+                    });
+                    future::ready(())
                 })
                 .await;
+            set.join_all().await;
             state.streams.remove(&id);
+            println!("Stream for {} has ended", id);
         }
     });
-    state.streams.insert(id, sender.clone());
-    let return_stream = BroadcastStream::new(sender.lock().await.subscribe());
-    Ok(Body::from_stream(return_stream))
+    Ok(Body::from_stream(return_stream).into_response())
 }
